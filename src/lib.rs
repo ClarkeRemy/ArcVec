@@ -3,13 +3,47 @@ use core::sync::atomic::AtomicUsize;
 use core::ptr::NonNull;
 use core::marker::PhantomData;
 extern crate alloc;
-use alloc::alloc::{Layout,alloc};
+use alloc::alloc::{Layout,alloc,dealloc};
 
 pub struct ArcVec<T>(
  NonNull<VecMem<T>>,
  PhantomData<VecMem<T>>);
 unsafe impl<T: Sync + Send> Send for ArcVec<T> {}
 unsafe impl<T: Sync + Send> Sync for ArcVec<T> {}
+
+impl<T> ArcVec<T> {
+ fn with_capacity(cap:usize)->ArcVec<T>{
+  ArcVec(VecMem::alloc(cap),PhantomData)
+ }
+}
+
+impl<T> Clone for ArcVec<T> {
+ fn clone(&self)->Self {
+  unsafe{self.0.as_ref()}
+   .count.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+  unsafe {core::mem::transmute_copy(self)}
+ }
+}
+
+impl<T> Drop for ArcVec<T> {
+ fn drop(&mut self){
+  use core::ptr::{slice_from_raw_parts_mut,drop_in_place};
+  let ptr = self.0.as_ptr();
+  let VecMem { count, len, cap, data } 
+   = unsafe{&mut *ptr};
+  if count.fetch_sub(1, core::sync::atomic::Ordering::SeqCst) == 1 {
+  let to_drop
+   = slice_from_raw_parts_mut(data.as_mut_ptr(), *len);
+  unsafe{ 
+   drop_in_place(to_drop); 
+   let msg ="Logic error calculating `Layout` when deallocating";
+   dealloc(ptr as *mut u8, 
+    Layout::new::<VecMem<T>>()
+     .extend(Layout::array::<T>(*cap).expect(msg)).expect(msg).0)
+   }
+  }
+ }
+}
 
 #[repr(C)] 
 struct VecMem<T> {
@@ -18,9 +52,11 @@ struct VecMem<T> {
 }
 
 impl<T> VecMem<T> {
- fn with_capacity_raw(cap:usize)->NonNull<Self> {
+ fn alloc(cap:usize)->NonNull<Self> {
   if cap as usize >= isize::MAX as usize {alloc_overflow()};
-  let (lay,_offset) = Layout::new::<VecMem<T>>().extend(Layout::array::<T>(cap).expect("Layout Error")).expect("Layout Error");
+  let (lay,_offset) = 
+   Layout::new::<VecMem<T>>().extend(Layout::array::<T>(cap)
+    .expect("Layout Error")).expect("Layout Error");
   unsafe{ 
    let ptr = alloc(lay.clone());
    
@@ -34,7 +70,6 @@ impl<T> VecMem<T> {
   }
  }
 }
-
 
 #[inline(never)]
 #[cold]
