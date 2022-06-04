@@ -1,3 +1,5 @@
+#![no_std]
+
 use core::sync::atomic::{self,AtomicUsize,};
 use core::ptr::NonNull;
 use core::marker::PhantomData;
