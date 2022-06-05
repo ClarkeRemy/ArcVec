@@ -188,13 +188,7 @@ impl<T> ArcVecAlloc<T> {
         }
     }
 }
-/*
-           let ptr = ptr as *mut ArcVecAlloc<T>;
-           core::ptr::addr_of_mut!((*ptr).count).write(AtomicUsize::new(1));
-           core::ptr::addr_of_mut!((*ptr).len).write(0);
-           core::ptr::addr_of_mut!((*ptr).count).write(cap);
-           NonNull::new_unchecked(ptr)
-*/
+
 
 #[inline(never)]
 #[cold]
