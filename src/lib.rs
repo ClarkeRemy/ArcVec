@@ -2,6 +2,8 @@
 #![allow(unsafe_op_in_unsafe_fn, unused_unsafe)]
 
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
+use core::ops::Add;
 // use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::{addr_of, addr_of_mut, NonNull};
 use core::sync::atomic::{self, AtomicUsize};
@@ -16,8 +18,8 @@ impl<T> ArcVec<T> {
   fn with_capacity(cap: usize) -> ArcVec<T> {
     ArcVec(ArcVecAlloc::alloc(cap), PhantomData)
   }
-
-  fn as_slice(&self) -> &[T] {
+  /// Returns a __read-only slice__
+  pub fn as_slice(&self) -> &[T] {
     let ptr = self.0.as_ptr();
     let data_ptr: *const T = unsafe {
       ptr
@@ -27,16 +29,46 @@ impl<T> ArcVec<T> {
     };
     unsafe { core::slice::from_raw_parts(data_ptr, *addr_of!((*ptr).len)) }
   }
-  /// Any time a mutable method or function is implemented with unsafe code, this must be called for safety
-  fn mutate(&mut self) -> &mut MutArcVec<T>
+  /// Uses `mutate` to create an owned value of MutArcVec
+  pub fn own(mut self) -> MutArcVec<T>
   where
     T: Clone, {
-    let ptr = self.0.as_ptr();
-
-    // safety :: MutArcVec<T> has the same layout
+    self.mutate();
+    // Safety :. * `self` has been mutated to no longer share data.
+    //           * `transmute` is safe because of `#[repr(transparent)]`
+    unsafe { core::mem::transmute(self) }
+  }
+  /// Try to make `MutArcVec<T>`
+  /// On the error case, recover the original value
+  ///
+  /// Most suitable when `T` isn't `Clone`
+  pub fn try_own(self) -> Result<MutArcVec<T>, Self> {
     if self.is_unique() {
+      return Ok(MutArcVec(self));
+    }
+    Err(self)
+  }
+  /// Try to make `&mut MutArcVec<T>`
+  /// On failure : `None`
+  ///
+  /// Most suitable when `T` isn't `Clone`
+  pub fn try_mut(&mut self) -> Option<&mut MutArcVec<T>> {
+    if self.is_unique() {
+      // Safety :. `transmute` is safe because of `#[repr(transparent)]`
+      return unsafe { Some(core::mem::transmute(self)) };
+    }
+    None
+  }
+  /// Any time a mutable method or function is implemented with unsafe code, this must be called for safety
+  pub fn mutate(&mut self) -> &mut MutArcVec<T>
+  where
+    T: Clone, {
+    if self.is_unique() {
+      // Safety :. `transmute` is safe because of `#[repr(transparent)]`
       return unsafe { core::mem::transmute(self) };
     }
+
+    let ptr = self.0.as_ptr();
 
     let mut switch =
       ArcVec::<core::mem::MaybeUninit<T>>::with_capacity(unsafe { *addr_of!((*ptr).cap) });
@@ -141,6 +173,9 @@ mod arc_vec_index;
 #[repr(transparent)]
 pub struct MutArcVec<T>(ArcVec<T>);
 impl<T> MutArcVec<T> {
+  fn with_capacity(cap: usize) -> Self {
+    MutArcVec(ArcVec::with_capacity(cap))
+  }
   fn as_mut_slice(&mut self) -> &mut [T] {
     unsafe { self.0.unchecked_slice_mut() }
   }
@@ -194,13 +229,18 @@ impl<T> MutArcVec<T> {
     }
     self
   }
-  // moves another to the end of self
-  pub fn append(&mut self, mut other: Self) -> &mut Self {
+  // Moves MutArcVec to the end of self
+  pub fn append(&mut self, other: Self) -> &mut Self {
+    self.append_reserve(other, 0)
+  }
+  // Moves another MutArcVec to the end of self, reserving excess capacity
+  // consider using this if you expect to continue mutating
+  pub fn append_reserve(&mut self, mut other: Self, excess: usize) -> &mut Self {
     let [len_1, cap_1] = self.len_cap();
     let [len_2, _cap_2] = other.len_cap();
-    if cap_1 < len_1 + len_2 {
+    if cap_1 < len_1 + len_2 + excess {
       self.reserve(
-        len_2 + 5, // the +5 is here to avoid excessive reallocations afterwards
+        len_2 + excess, // the +5 is here to avoid excessive reallocations afterwards
       );
     }
     let ptr_1 = self.0 .0.as_ptr();
@@ -212,11 +252,162 @@ impl<T> MutArcVec<T> {
     for (to, from) in (len_1..len_1 + len_2).zip(0..len_2) {
       core::mem::swap(&mut data_1[to], &mut data_2[from])
     }
-    // Safety :. We know that all values here are garbage that __must__ not drop
+    // Safety :. We know that all values here are garbage that __must not drop__
     let _ = core::mem::ManuallyDrop::new(other);
     self
   }
-  // pub fn shrink(&mut self)->&mut Self {}
+  pub fn shrink(&mut self) -> &mut Self {
+    let [len, cap] = self.len_cap();
+    if len == cap {
+      return self;
+    }
+    let mut switch = MutArcVec(ArcVec::with_capacity(len));
+    core::mem::swap(self, &mut switch);
+    self.append(switch)
+  }
+  pub fn shrink_to(&mut self, min_cap: usize) -> &mut Self {
+    let [len, cap] = self.len_cap();
+    if len >= min_cap || cap < min_cap {
+      return self;
+    }
+    let mut switch = MutArcVec(ArcVec::with_capacity(min_cap));
+    core::mem::swap(self, &mut switch);
+    self.append(switch)
+  }
+  // takes the MutArcVec, leaving an empty one in it's place
+  pub fn take(&mut self) -> Self {
+    let mut switch = MutArcVec(ArcVec::with_capacity(0));
+    core::mem::swap(self, &mut switch);
+    switch
+  }
+  /// first len elements; maintain capacity
+  pub fn truncate(&mut self, len: usize) -> &mut Self {
+    let [length, cap] = self.len_cap();
+    if len < length {
+      return self;
+    }
+    let s = self.as_mut_slice();
+    for idx in len..length {
+      // Safety :. we need to drop the values that will be truncated
+      unsafe { core::ptr::drop_in_place(&mut s[idx]) }
+    }
+    let ptr = self.0 .0.as_ptr();
+    // Safety :. The values at the back are now garbage,
+    //           so the length must be accesed to finally truncate
+    unsafe {
+      *addr_of_mut!((*ptr).len) = len;
+    }
+    self
+  }
+  /// Swaps index element with last element,
+  /// Then pops the back with &mut self
+  /// # Panics
+  /// Panics if `index` is out of bounds
+  pub fn swap_remove(&mut self, index: usize) -> (&mut Self, T) {
+    let ptr = self.0 .0.as_ptr();
+    let len = unsafe { *addr_of!((*ptr).len) };
+    if len < index {
+      panic!("index out of bounds")
+    }
+    let s = self.as_mut_slice();
+    let mut pop =
+      // Safety :. this garbage will repace the last element
+      unsafe { core::mem::MaybeUninit::<T>::uninit().assume_init() };
+    core::mem::swap(&mut pop, &mut s[len - 1]);
+    // Safety :. at this point, the last element is a garbage element, and can be truncated
+    unsafe { *addr_of_mut!((*ptr).len) -= 1 }
+    core::mem::swap(&mut pop, &mut s[index]);
+    (self, pop)
+  }
+  /// Insert element at index
+  /// and shift all after it to the right.
+  /// # Panics
+  /// Panics if index > len.
+  pub fn insert(&mut self, index: usize, element: T) -> &mut Self {
+    let len = self.len();
+    assert![index > len];
+    let ptr = self.reserve(1).0 .0.as_ptr();
+    let data_ptr: *mut T = unsafe {
+      ptr
+        .cast::<u8>()
+        .add(core::mem::size_of::<ArcVecAlloc<T>>())
+        .cast::<T>()
+    };
+    unsafe {
+      let p = data_ptr.add(index);
+      // slide values in the back to the right
+      core::ptr::copy(p, p.offset(1), len - index);
+      // overwrite without dropping, element gets moved
+      core::ptr::write(p, element);
+      // set the length
+      *addr_of_mut!((*ptr).len) += 1;
+    }
+    self
+  }
+
+  // TODO ::
+  //
+  // Remove at index, shifting all to the right one position left
+  // pub fn remove(&mut self, index: usize)-> (&mut Self,T)
+  //
+  // Retains only the elements specified by the predicate.
+  // operates in place
+  // pub fn retain<F>(&mut self, f:F)->&mut Self
+  // where F: FnMut(&T) -> bool,
+  //
+  // Retains only the elements specified by the predicate.
+  // operates in place
+  // pub fn retain_mut<F>(&mut self, f:F)->&mut Self
+  // where F: FnMut(&mut T) -> bool,
+  //
+  // pub fn pop(&mut self)->Option<T>
+  // pub fn pop_cont(&mut self)->(&mut Self,Option<T>)
+  //
+  // pub fn clear(&mut self)->&mut Self
+  // pub fn is_empty(&self)->bool
+  //
+  // /// the split off `MutArcVec` first element is `at`
+  // /// # Panics
+  // Panics at > len
+  // pub fn split_off(&mut self, at: usize)->(&mut Self,Self)
+  //
+  // /// Returns the remaining spare capacity of the vector as a slice of MaybeUninit<T>.
+  // pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>]
+  // /// similar, but also returns the init slice
+  // pub fn split_at_spare_mut(&mut self) -> (&mut [T], &mut [MaybeUninit<T>])
+
+  // TODO Soon
+  // extend_from_slice
+  // extend_from_within
+  // dedup
+  //
+
+  // TODO Last :
+  // dedup_by_key
+  // dedup_by
+  // drain
+  // drain_filter
+  // resize_with
+  // resize
+  // set_len
+  // replace_with
+
+  // deref?
+  // first
+  // first_mut
+  // split_first
+  // split_first_mut
+  // split_last
+  // split_last_mut
+  // last
+  // last_mut
+  // swap
+  // reverse
+
+  // iter
+  // iter_mut
+  // windows
+  //
 }
 
 impl<T> core::ops::Deref for MutArcVec<T> {
