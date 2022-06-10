@@ -173,13 +173,13 @@ mod arc_vec_index;
 #[repr(transparent)]
 pub struct MutArcVec<T>(ArcVec<T>);
 impl<T> MutArcVec<T> {
-  fn with_capacity(cap: usize) -> Self {
+  pub fn with_capacity(cap: usize) -> Self {
     MutArcVec(ArcVec::with_capacity(cap))
   }
-  fn as_mut_slice(&mut self) -> &mut [T] {
+  pub fn as_mut_slice(&mut self) -> &mut [T] {
     unsafe { self.0.unchecked_slice_mut() }
   }
-  fn as_slice(&self) -> &[T] {
+  pub fn as_slice(&self) -> &[T] {
     self.0.as_slice()
   }
   pub fn len(&self) -> usize {
@@ -282,7 +282,7 @@ impl<T> MutArcVec<T> {
   }
   /// first len elements; maintain capacity
   pub fn truncate(&mut self, len: usize) -> &mut Self {
-    let [length, cap] = self.len_cap();
+    let length = self.len();
     if len < length {
       return self;
     }
@@ -311,10 +311,11 @@ impl<T> MutArcVec<T> {
     }
     let s = self.as_mut_slice();
     let mut pop =
-      // Safety :. this garbage will repace the last element
+      // Safety :. this garbage will replace the last element
       unsafe { core::mem::MaybeUninit::<T>::uninit().assume_init() };
     core::mem::swap(&mut pop, &mut s[len - 1]);
-    // Safety :. at this point, the last element is a garbage element, and can be truncated
+    // Safety :. At this point, the last element is a garbage element,
+    //           and can be truncated without dropping the garbage.
     unsafe { *addr_of_mut!((*ptr).len) -= 1 }
     core::mem::swap(&mut pop, &mut s[index]);
     (self, pop)
@@ -325,7 +326,7 @@ impl<T> MutArcVec<T> {
   /// Panics if index > len.
   pub fn insert(&mut self, index: usize, element: T) -> &mut Self {
     let len = self.len();
-    assert![index > len];
+    assert![index < len];
     let ptr = self.reserve(1).0 .0.as_ptr();
     let data_ptr: *mut T = unsafe {
       ptr
@@ -334,7 +335,7 @@ impl<T> MutArcVec<T> {
         .cast::<T>()
     };
     unsafe {
-      let p = data_ptr.add(index);
+      let p: *mut T = data_ptr.add(index);
       // slide values in the back to the right
       core::ptr::copy(p, p.offset(1), len - index);
       // overwrite without dropping, element gets moved
@@ -344,24 +345,92 @@ impl<T> MutArcVec<T> {
     }
     self
   }
+  /// Remove at index, shifting all to the right one position left
+  pub fn remove(&mut self, index: usize) -> (&mut Self, T) {
+    let len = self.len();
+    assert![index < len];
+
+    let mut pop = unsafe { MaybeUninit::<T>::uninit().assume_init() };
+    // ATTENTION :. we've swapped in a garbage value. we will need to overwrite it
+    core::mem::swap(&mut self.as_mut_slice()[index], &mut pop);
+    let ptr = self.0 .0.as_ptr();
+    let data_ptr: *mut T = unsafe {
+      ptr
+        .cast::<u8>()
+        .add(core::mem::size_of::<ArcVecAlloc<T>>())
+        .cast::<T>()
+    };
+    // Safety :. we need to overwrite the garbage value __without__ dropping it
+    unsafe {
+      let p: *mut T = data_ptr.add(index);
+      // slide values in the back to the left, overwriting the garbage value
+      core::ptr::copy(p, p.offset(-1), len - index);
+      // set the length, duplicate last value will not be dropped
+      *addr_of_mut!((*ptr).len) -= 1;
+    }
+    (self, pop)
+  }
+
+  /// Retains only the elements specified by the predicate.
+  /// operates in place
+  pub fn retain<F>(&mut self, mut f: F) -> &mut Self
+  where
+    F: FnMut(&T) -> bool, {
+    let len = self.len();
+    let mut swap_idx = len; // assumes best case initialy
+    let s = self.as_mut_slice();
+    for idx in 0..len {
+      if !f(&s[idx]) {
+        swap_idx = idx;
+        break;
+      }
+    }
+    if swap_idx != len {
+      for idx in swap_idx + 1..len {
+        if !f(&s[idx]) {
+          continue;
+        }
+        s.swap(idx, swap_idx);
+        swap_idx += 1;
+      }
+    }
+    let ptr = self.0 .0.as_ptr();
+    unsafe { *addr_of_mut!((*ptr).len) = swap_idx }
+    self
+  }
+  /// Retains only the elements specified by the predicate.
+  /// operates in place
+  pub fn retain_mut<F>(&mut self, mut f: F) -> &mut Self
+  where
+    F: FnMut(&mut T) -> bool, {
+    // I'd like to refactor retain and retain_mut, to avoid code duplication.
+    let len = self.len();
+    let mut swap_idx = len; // assumes best case initialy
+    let s = self.as_mut_slice();
+    for idx in 0..len {
+      if !f(&mut s[idx]) {
+        swap_idx = idx;
+        break;
+      }
+    }
+    if swap_idx != len {
+      for idx in swap_idx + 1..len {
+        if !f(&mut s[idx]) {
+          continue;
+        }
+        s.swap(idx, swap_idx);
+        swap_idx += 1;
+      }
+    }
+    let ptr = self.0 .0.as_ptr();
+    unsafe { *addr_of_mut!((*ptr).len) = swap_idx }
+    self
+  }
 
   // TODO ::
   //
-  // Remove at index, shifting all to the right one position left
-  // pub fn remove(&mut self, index: usize)-> (&mut Self,T)
-  //
-  // Retains only the elements specified by the predicate.
-  // operates in place
-  // pub fn retain<F>(&mut self, f:F)->&mut Self
-  // where F: FnMut(&T) -> bool,
-  //
-  // Retains only the elements specified by the predicate.
-  // operates in place
-  // pub fn retain_mut<F>(&mut self, f:F)->&mut Self
-  // where F: FnMut(&mut T) -> bool,
-  //
   // pub fn pop(&mut self)->Option<T>
-  // pub fn pop_cont(&mut self)->(&mut Self,Option<T>)
+  // pub fn pop_(&mut self)->(&mut Self,Option<T>)
   //
   // pub fn clear(&mut self)->&mut Self
   // pub fn is_empty(&self)->bool
