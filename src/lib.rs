@@ -310,7 +310,7 @@ impl<T> MutArcVec<T> {
       panic!("index out of bounds")
     }
     let s = self.as_mut_slice();
-    s.swap(index,len-1);
+    s.swap(index, len - 1);
     self.pop().unwrap()
   }
   pub fn swap_remove_(&mut self, index: usize) -> (&mut Self, T) {
@@ -347,7 +347,7 @@ impl<T> MutArcVec<T> {
     let len = self.len();
     assert![index < len];
 
-    let pop = unsafe{ core::ptr::read(&mut self.as_mut_slice()[index])};
+    let pop = unsafe { core::ptr::read(&mut self.as_mut_slice()[index]) };
     let ptr = self.0 .0.as_ptr();
     let data_ptr: *mut T = unsafe {
       ptr
@@ -390,9 +390,7 @@ impl<T> MutArcVec<T> {
       }
     }
     for drop_idx in swap_idx..len {
-      unsafe{
-        core::ptr::drop_in_place(&mut s[drop_idx])
-      }
+      unsafe { core::ptr::drop_in_place(&mut s[drop_idx]) }
     }
     let ptr = self.0 .0.as_ptr();
     unsafe { *addr_of_mut!((*ptr).len) = swap_idx }
@@ -423,25 +421,25 @@ impl<T> MutArcVec<T> {
       }
     }
     for drop_idx in swap_idx..len {
-      unsafe{
-        core::ptr::drop_in_place(&mut s[drop_idx])
-      }
+      unsafe { core::ptr::drop_in_place(&mut s[drop_idx]) }
     }
     let ptr = self.0 .0.as_ptr();
     unsafe { *addr_of_mut!((*ptr).len) = swap_idx }
     self
   }
-  pub fn pop(&mut self)->Option<T> {
+  pub fn pop(&mut self) -> Option<T> {
     let len = self.len();
-    if len == 0 { return None }
-    let pop = unsafe{ core::ptr::read(&self.as_slice()[len-1])};
-    let ptr = self.0.0.as_ptr();
-    unsafe {*addr_of_mut!((*ptr).len) -=1};
+    if len == 0 {
+      return None;
+    }
+    let pop = unsafe { core::ptr::read(&self.as_slice()[len - 1]) };
+    let ptr = self.0 .0.as_ptr();
+    unsafe { *addr_of_mut!((*ptr).len) -= 1 };
     Some(pop)
   }
-  pub fn pop_(&mut self)->(&mut Self,Option<T>) {
+  pub fn pop_(&mut self) -> (&mut Self, Option<T>) {
     let pop = self.pop();
-    (self,pop)
+    (self, pop)
   }
 
   // TODO ::
