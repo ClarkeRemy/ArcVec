@@ -303,21 +303,18 @@ impl<T> MutArcVec<T> {
   /// Then pops the back with &mut self
   /// # Panics
   /// Panics if `index` is out of bounds
-  pub fn swap_remove(&mut self, index: usize) -> (&mut Self, T) {
+  pub fn swap_remove(&mut self, index: usize) -> T {
     let ptr = self.0 .0.as_ptr();
     let len = unsafe { *addr_of!((*ptr).len) };
-    if len < index {
+    if len <= index {
       panic!("index out of bounds")
     }
     let s = self.as_mut_slice();
-    let mut pop =
-      // Safety :. this garbage will replace the last element
-      unsafe { core::mem::MaybeUninit::<T>::uninit().assume_init() };
-    core::mem::swap(&mut pop, &mut s[len - 1]);
-    // Safety :. At this point, the last element is a garbage element,
-    //           and can be truncated without dropping the garbage.
-    unsafe { *addr_of_mut!((*ptr).len) -= 1 }
-    core::mem::swap(&mut pop, &mut s[index]);
+    s.swap(index,len-1);
+    self.pop().unwrap()
+  }
+  pub fn swap_remove_(&mut self, index: usize) -> (&mut Self, T) {
+    let pop = self.swap_remove(index);
     (self, pop)
   }
   /// Insert element at index
@@ -350,9 +347,7 @@ impl<T> MutArcVec<T> {
     let len = self.len();
     assert![index < len];
 
-    let mut pop = unsafe { MaybeUninit::<T>::uninit().assume_init() };
-    // ATTENTION :. we've swapped in a garbage value. we will need to overwrite it
-    core::mem::swap(&mut self.as_mut_slice()[index], &mut pop);
+    let pop = unsafe{ core::ptr::read(&mut self.as_mut_slice()[index])};
     let ptr = self.0 .0.as_ptr();
     let data_ptr: *mut T = unsafe {
       ptr
@@ -360,10 +355,10 @@ impl<T> MutArcVec<T> {
         .add(core::mem::size_of::<ArcVecAlloc<T>>())
         .cast::<T>()
     };
-    // Safety :. we need to overwrite the garbage value __without__ dropping it
+    // Safety :. we need to overwrite the removed value __without__ dropping it
     unsafe {
       let p: *mut T = data_ptr.add(index);
-      // slide values in the back to the left, overwriting the garbage value
+      // slide values in the back to the left, overwriting the value
       core::ptr::copy(p, p.offset(-1), len - index);
       // set the length, duplicate last value will not be dropped
       *addr_of_mut!((*ptr).len) -= 1;
@@ -394,6 +389,11 @@ impl<T> MutArcVec<T> {
         swap_idx += 1;
       }
     }
+    for drop_idx in swap_idx..len {
+      unsafe{
+        core::ptr::drop_in_place(&mut s[drop_idx])
+      }
+    }
     let ptr = self.0 .0.as_ptr();
     unsafe { *addr_of_mut!((*ptr).len) = swap_idx }
     self
@@ -422,15 +422,30 @@ impl<T> MutArcVec<T> {
         swap_idx += 1;
       }
     }
+    for drop_idx in swap_idx..len {
+      unsafe{
+        core::ptr::drop_in_place(&mut s[drop_idx])
+      }
+    }
     let ptr = self.0 .0.as_ptr();
     unsafe { *addr_of_mut!((*ptr).len) = swap_idx }
     self
   }
+  pub fn pop(&mut self)->Option<T> {
+    let len = self.len();
+    if len == 0 { return None }
+    let pop = unsafe{ core::ptr::read(&self.as_slice()[len-1])};
+    let ptr = self.0.0.as_ptr();
+    unsafe {*addr_of_mut!((*ptr).len) -=1};
+    Some(pop)
+  }
+  pub fn pop_(&mut self)->(&mut Self,Option<T>) {
+    let pop = self.pop();
+    (self,pop)
+  }
 
   // TODO ::
   //
-  // pub fn pop(&mut self)->Option<T>
-  // pub fn pop_(&mut self)->(&mut Self,Option<T>)
   //
   // pub fn clear(&mut self)->&mut Self
   // pub fn is_empty(&self)->bool
