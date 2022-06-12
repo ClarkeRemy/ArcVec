@@ -2,8 +2,7 @@
 #![allow(unsafe_op_in_unsafe_fn, unused_unsafe)]
 
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
-use core::ops::Add;
+use core::mem::{ManuallyDrop, MaybeUninit};
 // use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::{addr_of, addr_of_mut, NonNull};
 use core::sync::atomic::{self, AtomicUsize};
@@ -245,9 +244,7 @@ impl<T> MutArcVec<T> {
     let [len_1, cap_1] = self.len_cap();
     let [len_2, _cap_2] = other.len_cap();
     if cap_1 < len_1 + len_2 + excess {
-      self.reserve(
-        len_2 + excess, // the +5 is here to avoid excessive reallocations afterwards
-      );
+      self.reserve(len_2 + excess);
     }
     let ptr_1 = self.0 .0.as_ptr();
     unsafe {
@@ -486,48 +483,192 @@ impl<T> MutArcVec<T> {
     (self, split)
   }
 
-  // TODO ::
-  //
-  //
-  // /// Returns the remaining spare capacity of the vector as a slice of MaybeUninit<T>.
-  // pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>]
-  // /// similar, but also returns the init slice
-  // pub fn split_at_spare_mut(&mut self) -> (&mut [T], &mut [MaybeUninit<T>])
+  /// Returns the remaining spare capacity of the vector as a slice of MaybeUninit<T>.
+  pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+    // for now we will do the lazy implementation
+    self.split_at_spare_mut().1
+  }
+  /// similar, but also returns the init slice
+  pub fn split_at_spare_mut(&mut self) -> (&mut [T], &mut [MaybeUninit<T>]) {
+    let [len, cap] = self.len_cap();
+    let ptr = self.0 .0.as_ptr();
+    let data_ptr: *mut T = unsafe {
+      ptr
+        .cast::<u8>()
+        .add(core::mem::size_of::<ArcVecAlloc<T>>())
+        .cast::<T>()
+    };
+    let spare_ptr = unsafe {
+      data_ptr
+        .offset(len as isize)
+        .cast::<core::mem::MaybeUninit<T>>()
+    };
+    unsafe {
+      (
+        core::slice::from_raw_parts_mut(data_ptr, len),
+        core::slice::from_raw_parts_mut(spare_ptr, cap - len),
+      )
+    }
+  }
+}
+impl<T> MutArcVec<T>
+where
+  T: core::cmp::PartialEq<T>,
+{
+  pub fn dedup(&mut self) -> &mut Self {
+    let len = self.len();
+    if len < 2 {
+      return self;
+    }
 
-  // TODO Soon
-  // extend_from_slice
-  // extend_from_within
-  // dedup
-  //
+    let ptr = self.0 .0.as_ptr();
+    let data_ptr: *mut T = unsafe {
+      ptr
+        .cast::<u8>()
+        .add(core::mem::size_of::<ArcVecAlloc<T>>())
+        .cast::<T>()
+    };
 
-  // TODO Last :
-  // dedup_by_key
-  // dedup_by
-  // drain
-  // drain_filter
-  // resize_with
-  // resize
-  // set_len
-  // replace_with
+    let mut final_len = len;
+    // Safety :. the pointers will be always be different by at least an
+    //           offset of 1 one in either loop,
+    //           so they never alias while in actual use.
+    let [mut left, mut right]: [*mut T; 2] = [data_ptr; 2];
+    // optimistic loop first
+    for idx in 1..len {
+      left = right;
+      right = unsafe { data_ptr.add(idx) };
+      if unsafe { &addr_of!(left) == &addr_of!(right) } {
+        final_len = idx + 1;
+        break;
+      }
+    }
+    // if the optimistic loop breaks, this one will run
+    for idx in final_len..len {
+      right = unsafe { data_ptr.add(idx) };
+      if unsafe { &addr_of!(left) != &addr_of!(right) } {
+        unsafe {
+          let overwrite_ptr = left.add(1);
+          core::ptr::drop_in_place(overwrite_ptr);
+          core::ptr::write(overwrite_ptr, core::ptr::read(right));
+        }
+        left = unsafe { left.add(1) };
+        continue;
+      }
+    }
+    unsafe { *addr_of_mut!((*ptr).len) = final_len }
+    self
+  }
+}
+impl<T> MutArcVec<T>
+where
+  T: Clone,
+{
+  pub fn extend_from_slice(&mut self, other: &[T]) -> &mut Self {
+    let o_len = other.len();
+    self.reserve(o_len);
+    let len = self.len();
+    let ptr = self.0 .0.as_ptr();
+    let data_ptr = unsafe {
+      ptr
+        .cast::<u8>()
+        .add(core::mem::size_of::<ArcVecAlloc<T>>())
+        .cast::<T>()
+    };
+    for (src, dest) in (0..o_len).zip(len..len + o_len) {
+      let _ =
+        unsafe { core::mem::ManuallyDrop::new(data_ptr.add(dest).replace(other[src].clone())) };
+    }
+    self
+  }
 
-  // deref?
-  // first
-  // first_mut
-  // split_first
-  // split_first_mut
-  // split_last
-  // split_last_mut
-  // last
-  // last_mut
-  // swap
-  // reverse
+  pub fn extend_from_within<R>(&mut self, src: R) -> &mut Self
+  where
+    R: core::ops::RangeBounds<usize>, {
+    let len = self.len();
 
-  // iter
-  // iter_mut
-  // windows
-  //
+    use core::ops::Bound::{Excluded as Ex, Included as In, Unbounded as Un};
+    #[rustfmt::skip]
+    let range = match (src.start_bound(), src.end_bound()) {
+      (Un   , Un   ) =>  0..len,
+      (In(s), Un   ) => *s..len,
+      (Un   , Ex(e)) =>  0..*e,
+      (In(s), Ex(e)) => *s..*e,
+      (Un   , In(e)) =>  0.. e + 1,
+      (In(s), In(e)) => *s.. e + 1,
+      _ => unreachable!("Ranges that start exclusively are not supported"),
+    };
+    if !(range.start < len && range.end <= len) {
+      panic!("Range does not fit within bounds")
+    };
+    let range_len = range.len();
+    self.reserve(range_len);
+    let ptr = self.0 .0.as_ptr();
+    let data_ptr = unsafe {
+      ptr
+        .cast::<u8>()
+        .add(core::mem::size_of::<ArcVecAlloc<T>>())
+        .cast::<T>()
+    };
+    for (src, dest) in range.zip(len..len + range_len) {
+      let _ = ManuallyDrop::new(unsafe {
+        core::ptr::replace(data_ptr.add(dest), (*addr_of![*data_ptr.add(src)]).clone())
+      });
+    }
+    unsafe {
+      *addr_of_mut!((*ptr).len) = len + range_len;
+    }
+    self
+  }
+
+  pub fn resize(&mut self, new_len: usize, value: T) -> &mut Self {
+    let len = self.len();
+    if len >= new_len {
+      return self.truncate(new_len);
+    }
+    let ptr = self.0 .0.as_ptr();
+    let spare_cap_ptr = unsafe {
+      ptr
+        .cast::<u8>()
+        .add(core::mem::size_of::<ArcVecAlloc<T>>())
+        .cast::<T>()
+        .add(len)
+    };
+    for idx in 0..new_len - len {
+      let _ =
+        ManuallyDrop::new(unsafe { core::ptr::replace(spare_cap_ptr.add(idx), value.clone()) });
+    }
+    self
+  }
 }
 
+// TODO Soon
+// resize_with
+// replace_with
+
+// TODO Last :
+// dedup_by_key
+// dedup_by
+// drain
+// drain_filter
+// set_len
+
+// deref?
+// first
+// first_mut
+// split_first
+// split_first_mut
+// split_last
+// split_last_mut
+// last
+// last_mut
+// swap
+// reverse
+
+// iter
+// iter_mut
+// windows
+//
 impl<T> core::ops::Deref for MutArcVec<T> {
   type Target = [T];
   fn deref(&self) -> &Self::Target {
