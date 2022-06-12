@@ -102,7 +102,13 @@ impl<T> ArcVec<T> {
   pub fn is_unique(&self) -> bool {
     1 == unsafe { &*core::ptr::addr_of!((*self.0.as_ptr()).count) }.load(atomic::Ordering::Acquire)
   }
-
+  pub fn is_empty(&self) -> bool {
+    if self.len() == 0 {
+      true
+    } else {
+      false
+    }
+  }
   pub fn len(&self) -> usize {
     unsafe { *addr_of![(*self.0.as_ptr()).len] }
   }
@@ -441,17 +447,47 @@ impl<T> MutArcVec<T> {
     let pop = self.pop();
     (self, pop)
   }
+  pub fn clear(&mut self) -> &mut Self {
+    let s = self.as_mut_slice();
+    for to_drop in s {
+      unsafe { core::ptr::drop_in_place(to_drop) }
+    }
+    let ptr = self.0 .0.as_ptr();
+    unsafe { *addr_of_mut!((*ptr).len) = 0 }
+    self
+  }
+  pub fn is_empty(&self) -> bool {
+    self.0.is_empty()
+  }
+  /// the split off `MutArcVec` first element is `at`
+  /// # Panics
+  /// Panics at > len
+  pub fn split_off(&mut self, at: usize) -> Self {
+    let len = self.len();
+    assert! {!(at > len)}
+    let off_cap = len - at;
+    let off = Self::with_capacity(off_cap);
+    let ptr_off = off.0 .0.as_ptr();
+    let s = self.as_mut_slice();
+    let data_ptr: *mut T = unsafe {
+      ptr_off
+        .cast::<u8>()
+        .add(core::mem::size_of::<ArcVecAlloc<T>>())
+        .cast::<T>()
+    };
+    unsafe { core::ptr::copy(&mut s[at], data_ptr, off_cap) }
+    unsafe { *addr_of_mut!((*ptr_off).len) = off_cap }
+    let ptr = self.0 .0.as_ptr();
+    unsafe { *addr_of_mut!((*ptr).len) = at }
+    off
+  }
+  pub fn split_off_(&mut self, at: usize) -> (&mut Self, Self) {
+    let split = self.split_off(at);
+    (self, split)
+  }
 
   // TODO ::
   //
-  //
-  // pub fn clear(&mut self)->&mut Self
-  // pub fn is_empty(&self)->bool
-  //
-  // /// the split off `MutArcVec` first element is `at`
-  // /// # Panics
-  // Panics at > len
-  // pub fn split_off(&mut self, at: usize)->(&mut Self,Self)
   //
   // /// Returns the remaining spare capacity of the vector as a slice of MaybeUninit<T>.
   // pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>]
