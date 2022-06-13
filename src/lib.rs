@@ -226,7 +226,7 @@ impl<T> MutArcVec<T> {
       let ptr = self.0 .0.as_ptr();
       unsafe { *addr_of_mut!((*ptr).len) += 1 };
       core::mem::swap(
-        &mut self.as_mut_slice()[unsafe { *addr_of_mut!((*ptr).len) }],
+        &mut self.as_mut_slice()[len], // Note :. this is the old len
         &mut val,
       );
       // Safety :. We know that this value is garbage that __must__ not drop
@@ -510,7 +510,28 @@ impl<T> MutArcVec<T> {
       )
     }
   }
+  pub fn resize_with<F>(&mut self, new_len: usize, mut f: F) -> &mut Self
+  where
+    F: FnMut() -> T, {
+    let len = self.len();
+    if len >= new_len {
+      return self.truncate(new_len);
+    }
+    let ptr = self.reserve(new_len).0 .0.as_ptr();
+    let spare_cap_ptr = unsafe {
+      ptr
+        .cast::<u8>()
+        .add(core::mem::size_of::<ArcVecAlloc<T>>())
+        .cast::<T>()
+        .add(len)
+    };
+    for idx in 0..new_len - len {
+      let _ = ManuallyDrop::new(unsafe { core::ptr::replace(spare_cap_ptr.add(idx), f()) });
+    }
+    self
+  }
 }
+
 impl<T> MutArcVec<T>
 where
   T: core::cmp::PartialEq<T>,
@@ -626,7 +647,7 @@ where
     if len >= new_len {
       return self.truncate(new_len);
     }
-    let ptr = self.0 .0.as_ptr();
+    let ptr = self.reserve(new_len).0 .0.as_ptr();
     let spare_cap_ptr = unsafe {
       ptr
         .cast::<u8>()
@@ -642,16 +663,13 @@ where
   }
 }
 
-// TODO Soon
-// resize_with
-// replace_with
-
 // TODO Last :
 // dedup_by_key
 // dedup_by
 // drain
 // drain_filter
 // set_len
+// splice
 
 // deref?
 // first
@@ -707,7 +725,6 @@ impl<T> ArcVecAlloc<T> {
         alloc::alloc::handle_alloc_error(lay)
       }
       let ptr = ptr as *mut ArcVecAlloc<T>;
-      use core::ptr::addr_of_mut;
       addr_of_mut!((*ptr).count).write(AtomicUsize::new(1));
       addr_of_mut!((*ptr).len).write(0);
       addr_of_mut!((*ptr).cap).write(cap);
@@ -722,11 +739,69 @@ fn alloc_overflow() -> ! {
   panic!("overflow during Layout computation")
 }
 
+impl<T> core::iter::IntoIterator for MutArcVec<T> {
+  type Item = T;
+  type IntoIter = IntoIterMutArcVec<T>;
+  fn into_iter(self) -> Self::IntoIter {
+    let range = 0..self.len();
+    IntoIterMutArcVec {
+      owned: self,
+      range,
+      rev: false,
+    }
+  }
+}
+pub struct IntoIterMutArcVec<T> {
+  owned: MutArcVec<T>,
+  range: core::ops::Range<usize>,
+  rev: bool,
+}
+impl<T> Iterator for IntoIterMutArcVec<T> {
+  type Item = T;
+  fn next(&mut self) -> Option<Self::Item> {
+    let ptr = self.owned.0 .0.as_ptr();
+    if self.range.len() == 0 {
+      unsafe {
+        *addr_of_mut!((*ptr).len) = 0;
+      }
+      return None;
+    }
+    let move_idx;
+    if self.rev {
+      move_idx = self.range.end - 1;
+      self.range.end -= 1
+    } else {
+      move_idx = self.range.start;
+      self.range.start += 1
+    }
+    Some(unsafe {
+      core::ptr::read(
+        ptr
+          .cast::<u8>()
+          .add(core::mem::size_of::<ArcVecAlloc<T>>())
+          .cast::<T>()
+          .add(move_idx),
+      )
+    })
+  }
+}
+
 #[cfg(test)]
 mod tests {
+  use crate::MutArcVec;
+
   #[test]
-  fn it_works() {
-    let result = 2 + 2;
-    assert_eq!(result, 4);
+  fn first_test() {
+    let mut v = MutArcVec::with_capacity(10);
+    let mut arr = [1u32, 2, 3, 4, 5];
+    for i in arr.as_mut_slice() {
+      v.push(*i);
+    }
+    assert_eq!(v.as_slice(), arr.as_slice());
+
+    for (a, b) in v.iter().zip(arr.as_slice()) {
+      assert_eq!(a, b)
+    }
+    let _y = alloc::vec![2u32, 3, 4].into_iter();
   }
 }
